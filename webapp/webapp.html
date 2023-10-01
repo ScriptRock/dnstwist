@@ -156,7 +156,19 @@ span#source {
 	<span id="source">[<a href="https://github.com/elceef/dnstwist">source code</a>]</span>
 </body>
 <script>
+window.onload = function() {
+	if (window.location.hash) {
+		$('#sid').val(window.location.hash.substring(1));
+		fetchDomains();
+	}
+}
+
 last_registered = 0;
+
+function shareResults() {
+	navigator.clipboard.writeText(window.location.href.split('#')[0] + '#' + sid);
+	$('#status').html('Copied URL to clipboard!');
+}
 
 function fetchDomains() {
 	$.getJSON('/api/scans/' + $('#sid').val() + '/domains', function(data) {
@@ -168,14 +180,21 @@ function fetchDomains() {
 				'<th>MAIL SERVER</th>'
 			).appendTo('#data');
 		$.each(data, function(i, item) {
+			$.each(item, function(k, v) {
+				if (v instanceof Array) {
+					if (v[0] == '!ServFail') {
+						data[i][k][0] = '🚫'
+					}
+				}
+			})
 			fuzzer = item['fuzzer'] || ''
 			permutation = item['domain'] || ''
 			ipaddr = [
-				(item['dns_a'] || [''])[0].replace('!ServFail', '🚫'),
-				(item['dns_aaaa'] || [''])[0].replace('!ServFail', '')
+				(item['dns_a'] || [''])[0],
+				(item['dns_aaaa'] || [''])[0]
 			].filter(Boolean).join('</br>');
-			dns_ns = (item['dns_ns'] || [''])[0].replace('!ServFail', '🚫');
-			dns_mx = (item['dns_mx'] || [''])[0].replace('!ServFail', '🚫');
+			dns_ns = (item['dns_ns'] || [''])[0];
+			dns_mx = (item['dns_mx'] || [''])[0];
 			geoip = item['geoip'] || '';
 			$('<tr>').html(
 				'<td>' + permutation + ' <a href="http://' + permutation + '" id="link">🔗</a></br><sup>' + fuzzer + '</sup></td>' +
@@ -195,14 +214,17 @@ function pollScan() {
 			setTimeout(pollScan, 250);
 		} else {
 			sid = $('#sid').val()
-			$('#status').html('Scanned <a href="/api/scans/' + sid + '/list">' + data['complete'] + '</a> suspicious domains. Identified ' + data['registered'] + ' registered: download as <a href="/api/scans/' + sid + '/csv">CSV</a> or <a href="/api/scans/' + sid + '/json">JSON</a>');
+			$('#status').html('Scanned <a href="/api/scans/' + sid + '/list">' + data['complete'] + '</a> permutations. Found ' + data['registered'] + ' registered: <a href="#" onclick="shareResults()">share it</a> or download as <a href="/api/scans/' + sid + '/csv">CSV</a> <a href="/api/scans/' + sid + '/json">JSON</a>');
 			$('#scan').text('Scan');
 		}
 		if (last_registered < data['registered']) {
 			last_registered = data['registered']
 			fetchDomains();
 		}
-    });
+    })
+	.fail(function(){
+		$('#status').html('Ups! Something went wrong...');
+	});
 }
 
 function actionScan() {
@@ -220,6 +242,7 @@ function actionScan() {
 			contentType: 'application/json',
 			success: function(data) {
 				$('#sid').val(data['id']);
+				$('#url').val(data['domain']);
 				$('#scan').text('Stop');
 				pollScan();
 			},
@@ -229,13 +252,13 @@ function actionScan() {
 			},
 		});
 	} else {
-		stop();
+		$('#scan').text('⏱');
 		$.post({
 			url: '/api/scans/' + $('#sid').val() + '/stop',
 			contentType: 'application/json',
-			success: function() {
-				$('#scan').text('Scan');
-			}
+		})
+		.always(function() {
+			$('#scan').text('Scan');
 		});
 	}
 }

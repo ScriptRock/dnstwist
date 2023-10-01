@@ -25,13 +25,13 @@ limitations under the License.
 '''
 
 __author__ = 'Marcin Ulikowski'
-__version__ = '20220815'
+__version__ = '20230918'
 __email__ = 'marcin@ulikowski.pl'
 
 import re
 import sys
 import socket
-socket.setdefaulttimeout(10.0)
+socket.setdefaulttimeout(12.0)
 import signal
 import time
 import argparse
@@ -44,17 +44,27 @@ import urllib.request
 import urllib.parse
 import gzip
 from io import BytesIO
+from datetime import datetime
+
+def _debug(msg):
+	if 'DEBUG' in os.environ:
+		if isinstance(msg, Exception):
+			print('{}:{} {}'.format(__file__, msg.__traceback__.tb_lineno, str(msg)), file=sys.stderr, flush=True)
+		else:
+			print(str(msg), file=sys.stderr, flush=True)
 
 try:
 	from PIL import Image
 	MODULE_PIL = True
-except ImportError:
+except ImportError as e:
+	_debug(e)
 	MODULE_PIL = False
 
 try:
 	from selenium import webdriver
 	MODULE_SELENIUM = True
-except ImportError:
+except ImportError as e:
+	_debug(e)
 	MODULE_SELENIUM = False
 
 try:
@@ -62,18 +72,21 @@ try:
 	import dns.rdatatype
 	from dns.exception import DNSException
 	MODULE_DNSPYTHON = True
-except ImportError:
+except ImportError as e:
+	_debug(e)
 	MODULE_DNSPYTHON = False
 
 GEOLITE2_MMDB = os.environ.get('GEOLITE2_MMDB' , os.path.join(os.path.dirname(__file__), 'GeoLite2-Country.mmdb'))
 try:
 	import geoip2.database
 	_ = geoip2.database.Reader(GEOLITE2_MMDB)
-except Exception:
+except Exception as e:
+	_debug(e)
 	try:
 		import GeoIP
 		_ = GeoIP.new(-1)
-	except Exception:
+	except Exception as e:
+		_debug(e)
 		MODULE_GEOIP = False
 	else:
 		MODULE_GEOIP = True
@@ -91,24 +104,28 @@ else:
 			return self.reader.country(ipaddr).country.name
 
 try:
-	import whois
-	MODULE_WHOIS = True
-except ImportError:
-	MODULE_WHOIS = False
-
-try:
 	import ssdeep
 	MODULE_SSDEEP = True
-except ImportError:
+except ImportError as e:
+	_debug(e)
 	try:
 		import ppdeep as ssdeep
 		MODULE_SSDEEP = True
-	except ImportError:
+	except ImportError as e:
+		_debug(e)
 		MODULE_SSDEEP = False
 
 try:
+	import tlsh
+	MODULE_TLSH = True
+except ImportError as e:
+	_debug(e)
+	MODULE_TLSH = False
+
+try:
 	import idna
-except ImportError:
+except ImportError as e:
+	_debug(e)
 	class idna:
 		@staticmethod
 		def decode(domain):
@@ -134,9 +151,12 @@ if sys.platform != 'win32' and sys.stdout.isatty():
 	FG_BLU = '\x1b[34m'
 	FG_RST = '\x1b[39m'
 	ST_BRI = '\x1b[1m'
+	ST_CLR = '\x1b[1K'
 	ST_RST = '\x1b[0m'
 else:
-	FG_RND = FG_YEL = FG_CYA = FG_BLU = FG_RST = ST_BRI = ST_RST = ''
+	FG_RND = FG_YEL = FG_CYA = FG_BLU = FG_RST = ST_BRI = ST_CLR = ST_RST = ''
+
+devnull = os.devnull
 
 
 def domain_tld(domain):
@@ -145,6 +165,8 @@ def domain_tld(domain):
 	except ImportError:
 		ctld = ['org', 'com', 'net', 'gov', 'edu', 'co', 'mil', 'nom', 'ac', 'info', 'biz']
 		d = domain.rsplit('.', 3)
+		if len(d) < 2:
+			return '', d[0], ''
 		if len(d) == 2:
 			return '', d[0], d[1]
 		if len(d) > 2:
@@ -160,13 +182,95 @@ def domain_tld(domain):
 		return d
 
 
+class Whois():
+	WHOIS_IANA = 'whois.iana.org'
+	TIMEOUT = 2.0
+	WHOIS_TLD = {
+		'com': 'whois.verisign-grs.com',
+		'net': 'whois.verisign-grs.com',
+		'org': 'whois.pir.org',
+		'info': 'whois.afilias.net',
+		'pl': 'whois.dns.pl',
+		'us': 'whois.nic.us',
+		'co': 'whois.nic.co',
+		'cn': 'whois.cnnic.cn',
+		'ru': 'whois.tcinet.ru',
+		'in': 'whois.registry.in',
+	}
+
+	def __init__(self):
+		self.whois_tld = self.WHOIS_TLD
+
+	def _brute_datetime(self, s):
+		formats = ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S%z', '%Y-%m-%d %H:%M', '%Y.%m.%d %H:%M',
+			'%Y.%m.%d %H:%M:%S', '%d.%m.%Y %H:%M:%S', '%a %b %d %Y', '%d-%b-%Y', '%Y-%m-%d')
+		for f in formats:
+			try:
+				dt = datetime.strptime(s, f)
+				return dt
+			except ValueError:
+				pass
+		return None
+
+	def _extract(self, response):
+		fields = {
+			'registrar': (r'[\r\n]registrar[ .]*:\s+(?:name:\s)?(?P<registrar>[^\r\n]+)', str),
+			'creation_date': (r'[\r\n](?:created(?: on)?|creation date|registered(?: on)?)[ .]*:\s+(?P<creation_date>[^\r\n]+)', self._brute_datetime),
+		}
+		result = {'text': response}
+		response_reduced = '\r\n'.join([x.strip() for x in response.splitlines() if not x.startswith('%')])
+		for field, (pattern, func) in fields.items():
+			match = re.search(pattern, response_reduced, re.IGNORECASE | re.MULTILINE)
+			if match:
+				result[field] = func(match.group(1))
+			else:
+				result[field] = None
+		return result
+
+	def query(self, query, server=None):
+		_, _, tld = domain_tld(query)
+		server = server or self.whois_tld.get(tld, self.WHOIS_IANA)
+		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		sock.settimeout(self.TIMEOUT)
+		response = b''
+		try:
+			sock.connect((server, 43))
+			sock.send(query.encode() + b'\r\n')
+			while True:
+				buf = sock.recv(4096)
+				if not buf:
+					break
+				response += buf
+			if server and server != self.WHOIS_IANA and tld not in self.whois_tld:
+				self.whois_tld[tld] = server
+		except socket.timeout:
+			return ''
+		finally:
+			sock.close()
+		response = response.decode('utf-8', errors='ignore')
+		refer = re.search(r'refer:\s+(?P<server>\w[-.a-z0-9]+)', response, re.IGNORECASE | re.MULTILINE)
+		if refer:
+			return self.query(query, refer.group('server'))
+		return response
+
+	def whois(self, domain, server=None):
+		return self._extract(self.query(domain, server))
+
+
 class UrlOpener():
 	def __init__(self, url, timeout=REQUEST_TIMEOUT_HTTP, headers={}, verify=True):
+		http_headers = {'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+			'accept-encoding': 'gzip,identity',
+			'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8'}
+		for h, v in headers.items():
+			# do not override accepted encoding - only gzip,identity is supported
+			if h.lower() != 'accept-encoding':
+				http_headers[h.lower()] = v
 		if verify:
 			ctx = urllib.request.ssl.create_default_context()
 		else:
 			ctx = urllib.request.ssl._create_unverified_context()
-		request = urllib.request.Request(url, headers=headers)
+		request = urllib.request.Request(url, headers=http_headers)
 		with urllib.request.urlopen(request, timeout=timeout, context=ctx) as r:
 			self.headers = r.headers
 			self.code = r.code
@@ -182,7 +286,7 @@ class UrlOpener():
 				pass
 			else:
 				if meta_url:
-					self.__init__(meta_url.group(1), timeout=timeout, headers=headers, verify=verify)
+					self.__init__(meta_url.group(1), timeout=timeout, headers=http_headers, verify=verify)
 		self.normalized_content = self._normalize()
 
 	def _normalize(self):
@@ -198,14 +302,19 @@ class UrlOpener():
 
 class UrlParser():
 	def __init__(self, url):
+		if not url:
+			raise TypeError('argument has to be non-empty string')
 		u = urllib.parse.urlparse(url if '://' in url else 'http://{}'.format(url))
-		self.domain = u.hostname.lower()
-		self.domain = idna.encode(self.domain).decode()
-		if not self._validate_domain(self.domain):
-			raise ValueError('Invalid domain name') from None
-		self.scheme = u.scheme
+		self.scheme = u.scheme.lower()
 		if self.scheme not in ('http', 'https'):
-			raise ValueError('Invalid scheme') from None
+			raise ValueError('invalid scheme') from None
+		self.domain = u.hostname.lower()
+		try:
+			self.domain = idna.encode(self.domain).decode()
+		except Exception:
+			raise ValueError('invalid domain name') from None
+		if not self._validate_domain(self.domain):
+			raise ValueError('invalid domain name') from None
 		self.username = u.username
 		self.password = u.password
 		self.port = u.port
@@ -214,7 +323,7 @@ class UrlParser():
 		self.fragment = u.fragment
 
 	def _validate_domain(self, domain):
-		if len(domain) > 253:
+		if 1 > len(domain) > 253:
 			return False
 		if VALID_FQDN_REGEX.match(domain):
 			try:
@@ -264,7 +373,7 @@ class Permutation(dict):
 		return self['domain'] == other['domain']
 
 	def __lt__(self, other):
-		return self['fuzzer'] + self['domain'] < other['fuzzer'] + other['domain']
+		return self['fuzzer'] + ''.join(self.get('dns_a', [])[:1]) + self['domain'] < other['fuzzer'] + ''.join(other.get('dns_a', [])[:1]) + other['domain']
 
 	def is_registered(self):
 		return len(self) > 2
@@ -272,7 +381,7 @@ class Permutation(dict):
 
 class pHash():
 	def __init__(self, image, hsize=8):
-		img = Image.open(image).convert('L').resize((hsize, hsize), Image.ANTIALIAS)
+		img = Image.open(image).convert('L').resize((hsize, hsize), Image.LANCZOS)
 		pixels = list(img.getdata())
 		avg = sum(pixels) / len(pixels)
 		self.hash = ''.join('1' if p > avg else '0' for p in pixels)
@@ -292,7 +401,7 @@ class pHash():
 
 
 class HeadlessBrowser():
-	WEBDRIVER_TIMEOUT = 10
+	WEBDRIVER_TIMEOUT = 12
 	WEBDRIVER_ARGUMENTS = (
 		'--disable-dev-shm-usage',
 		'--ignore-certificate-errors',
@@ -364,67 +473,193 @@ class HeadlessBrowser():
 
 
 class Fuzzer():
+	glyphs_idn_by_tld = {
+		**dict.fromkeys(['cz', 'sk', 'uk', 'co.uk', 'nl', 'edu', 'us'], {
+			# IDN not supported by the corresponding registry
+		}),
+		**dict.fromkeys(['jp', 'co.jp', 'ad.jp', 'ne.jp'], {
+		}),
+		**dict.fromkeys(['cn', 'com.cn', 'tw', 'com.tw', 'net.tw'], {
+		}),
+		**dict.fromkeys(['br', 'com.br'], {
+			'a': ('à', 'á', 'â', 'ã'),
+			'c': ('ç',),
+			'e': ('é', 'ê'),
+			'i': ('í',),
+			'o': ('ó', 'ô', 'õ'),
+			'u': ('ú', 'ü'),
+			'y': ('ý', 'ÿ'),
+		}),
+		**dict.fromkeys(['dk'], {
+			'a': ('ä', 'å'),
+			'e': ('é',),
+			'o': ('ö', 'ø'),
+			'u': ('ü',),
+			'ae': ('æ',),
+		}),
+		**dict.fromkeys(['eu', 'de', 'pl'], {
+			'a': ('á', 'à', 'ă', 'â', 'å', 'ä', 'ã', 'ą', 'ā'),
+			'c': ('ć', 'ĉ', 'č', 'ċ', 'ç'),
+			'd': ('ď', 'đ'),
+			'e': ('é', 'è', 'ĕ', 'ê', 'ě', 'ë', 'ė', 'ę', 'ē'),
+			'g': ('ğ', 'ĝ', 'ġ', 'ģ'),
+			'h': ('ĥ', 'ħ'),
+			'i': ('í', 'ì', 'ĭ', 'î', 'ï', 'ĩ', 'į', 'ī'),
+			'j': ('ĵ',),
+			'k': ('ķ', 'ĸ'),
+			'l': ('ĺ', 'ľ', 'ļ', 'ł'),
+			'n': ('ń', 'ň', 'ñ', 'ņ'),
+			'o': ('ó', 'ò', 'ŏ', 'ô', 'ö', 'ő', 'õ', 'ø', 'ō'),
+			'r': ('ŕ', 'ř', 'ŗ'),
+			's': ('ś', 'ŝ', 'š', 'ş'),
+			't': ('ť', 'ţ', 'ŧ'),
+			'u': ('ú', 'ù', 'ŭ', 'û', 'ů', 'ü', 'ű', 'ũ', 'ų', 'ū'),
+			'w': ('ŵ',),
+			'y': ('ý', 'ŷ', 'ÿ'),
+			'z': ('ź', 'ž', 'ż'),
+			'ae': ('æ',),
+			'oe': ('œ',),
+		}),
+		**dict.fromkeys(['fi'], {
+			'3': ('ʒ',),
+			'a': ('á', 'ä', 'å', 'â'),
+			'c': ('č',),
+			'd': ('đ',),
+			'g': ('ǧ', 'ǥ'),
+			'k': ('ǩ',),
+			'n': ('ŋ',),
+			'o': ('õ', 'ö'),
+			's': ('š',),
+			't': ('ŧ',),
+			'z': ('ž',),
+		}),
+		**dict.fromkeys(['no'], {
+			'a': ('á', 'à', 'ä', 'å'),
+			'c': ('č', 'ç'),
+			'e': ('é', 'è', 'ê'),
+			'i': ('ï',),
+			'n': ('ŋ', 'ń', 'ñ'),
+			'o': ('ó', 'ò', 'ô', 'ö', 'ø'),
+			's': ('š',),
+			't': ('ŧ',),
+			'u': ('ü',),
+			'z': ('ž',),
+			'ae': ('æ',),
+		}),
+		**dict.fromkeys(['be', 'fr', 're', 'yt', 'pm', 'wf', 'tf', 'ch', 'li'], {
+			'a': ('à', 'á', 'â', 'ã', 'ä', 'å'),
+			'c': ('ç',),
+			'e': ('è', 'é', 'ê', 'ë'),
+			'i': ('ì', 'í', 'î', 'ï'),
+			'n': ('ñ',),
+			'o': ('ò', 'ó', 'ô', 'õ', 'ö'),
+			'u': ('ù', 'ú', 'û', 'ü'),
+			'y': ('ý', 'ÿ'),
+			'ae': ('æ',),
+			'oe': ('œ',),
+		}),
+		**dict.fromkeys(['ca'], {
+			'a': ('à', 'â'),
+			'c': ('ç',),
+			'e': ('è', 'é', 'ê', 'ë'),
+			'i': ('î', 'ï'),
+			'o': ('ô',),
+			'u': ('ù', 'û', 'ü'),
+			'y': ('ÿ',),
+			'ae': ('æ',),
+			'oe': ('œ',),
+		}),
+	}
+
+	glyphs_unicode = {
+		'2': ('ƻ',),
+		'3': ('ʒ',),
+		'5': ('ƽ',),
+		'a': ('ạ', 'ă', 'ȧ', 'ɑ', 'å', 'ą', 'â', 'ǎ', 'á', 'ə', 'ä', 'ã', 'ā', 'à'),
+		'b': ('ḃ', 'ḅ', 'ƅ', 'ʙ', 'ḇ', 'ɓ'),
+		'c': ('č', 'ᴄ', 'ċ', 'ç', 'ć', 'ĉ', 'ƈ'),
+		'd': ('ď', 'ḍ', 'ḋ', 'ɖ', 'ḏ', 'ɗ', 'ḓ', 'ḑ', 'đ'),
+		'e': ('ê', 'ẹ', 'ę', 'è', 'ḛ', 'ě', 'ɇ', 'ė', 'ĕ', 'é', 'ë', 'ē', 'ȩ'),
+		'f': ('ḟ', 'ƒ'),
+		'g': ('ǧ', 'ġ', 'ǵ', 'ğ', 'ɡ', 'ǥ', 'ĝ', 'ģ', 'ɢ'),
+		'h': ('ȟ', 'ḫ', 'ḩ', 'ḣ', 'ɦ', 'ḥ', 'ḧ', 'ħ', 'ẖ', 'ⱨ', 'ĥ'),
+		'i': ('ɩ', 'ǐ', 'í', 'ɪ', 'ỉ', 'ȋ', 'ɨ', 'ï', 'ī', 'ĩ', 'ị', 'î', 'ı', 'ĭ', 'į', 'ì'),
+		'j': ('ǰ', 'ĵ', 'ʝ', 'ɉ'),
+		'k': ('ĸ', 'ǩ', 'ⱪ', 'ḵ', 'ķ', 'ᴋ', 'ḳ'),
+		'l': ('ĺ', 'ł', 'ɫ', 'ļ', 'ľ'),
+		'm': ('ᴍ', 'ṁ', 'ḿ', 'ṃ', 'ɱ'),
+		'n': ('ņ', 'ǹ', 'ń', 'ň', 'ṅ', 'ṉ', 'ṇ', 'ꞑ', 'ñ', 'ŋ'),
+		'o': ('ö', 'ó', 'ȯ', 'ỏ', 'ô', 'ᴏ', 'ō', 'ò', 'ŏ', 'ơ', 'ő', 'õ', 'ọ', 'ø'),
+		'p': ('ṗ', 'ƿ', 'ƥ', 'ṕ'),
+		'q': ('ʠ',),
+		'r': ('ʀ', 'ȓ', 'ɍ', 'ɾ', 'ř', 'ṛ', 'ɽ', 'ȑ', 'ṙ', 'ŗ', 'ŕ', 'ɼ', 'ṟ'),
+		's': ('ṡ', 'ș', 'ŝ', 'ꜱ', 'ʂ', 'š', 'ś', 'ṣ', 'ş'),
+		't': ('ť', 'ƫ', 'ţ', 'ṭ', 'ṫ', 'ț', 'ŧ'),
+		'u': ('ᴜ', 'ų', 'ŭ', 'ū', 'ű', 'ǔ', 'ȕ', 'ư', 'ù', 'ů', 'ʉ', 'ú', 'ȗ', 'ü', 'û', 'ũ', 'ụ'),
+		'v': ('ᶌ', 'ṿ', 'ᴠ', 'ⱴ', 'ⱱ', 'ṽ'),
+		'w': ('ᴡ', 'ẇ', 'ẅ', 'ẃ', 'ẘ', 'ẉ', 'ⱳ', 'ŵ', 'ẁ'),
+		'x': ('ẋ', 'ẍ'),
+		'y': ('ŷ', 'ÿ', 'ʏ', 'ẏ', 'ɏ', 'ƴ', 'ȳ', 'ý', 'ỿ', 'ỵ'),
+		'z': ('ž', 'ƶ', 'ẓ', 'ẕ', 'ⱬ', 'ᴢ', 'ż', 'ź', 'ʐ'),
+		'ae': ('æ',),
+		'oe': ('œ',),
+	}
+
+	glyphs_ascii = {
+		'0': ('o',),
+		'1': ('l', 'i'),
+		'3': ('8',),
+		'6': ('9',),
+		'8': ('3',),
+		'9': ('6',),
+		'b': ('d', 'lb'),
+		'c': ('e',),
+		'd': ('b', 'cl', 'dl'),
+		'e': ('c',),
+		'g': ('q',),
+		'h': ('lh'),
+		'i': ('1', 'l'),
+		'k': ('lc'),
+		'l': ('1', 'i'),
+		'm': ('n', 'nn', 'rn', 'rr'),
+		'n': ('m', 'r'),
+		'o': ('0',),
+		'q': ('g',),
+		'w': ('vv',),
+	}
+
+	latin_to_cyrillic = {
+		'a': 'а', 'b': 'ь', 'c': 'с', 'd': 'ԁ', 'e': 'е', 'g': 'ԍ', 'h': 'һ',
+		'i': 'і', 'j': 'ј', 'k': 'к', 'l': 'ӏ', 'm': 'м', 'o': 'о', 'p': 'р',
+		'q': 'ԛ', 's': 'ѕ', 't': 'т', 'v': 'ѵ', 'w': 'ԝ', 'x': 'х', 'y': 'у',
+	}
+
+	qwerty = {
+		'1': '2q', '2': '3wq1', '3': '4ew2', '4': '5re3', '5': '6tr4', '6': '7yt5', '7': '8uy6', '8': '9iu7', '9': '0oi8', '0': 'po9',
+		'q': '12wa', 'w': '3esaq2', 'e': '4rdsw3', 'r': '5tfde4', 't': '6ygfr5', 'y': '7uhgt6', 'u': '8ijhy7', 'i': '9okju8', 'o': '0plki9', 'p': 'lo0',
+		'a': 'qwsz', 's': 'edxzaw', 'd': 'rfcxse', 'f': 'tgvcdr', 'g': 'yhbvft', 'h': 'ujnbgy', 'j': 'ikmnhu', 'k': 'olmji', 'l': 'kop',
+		'z': 'asx', 'x': 'zsdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhjm', 'm': 'njk'
+	}
+	qwertz = {
+		'1': '2q', '2': '3wq1', '3': '4ew2', '4': '5re3', '5': '6tr4', '6': '7zt5', '7': '8uz6', '8': '9iu7', '9': '0oi8', '0': 'po9',
+		'q': '12wa', 'w': '3esaq2', 'e': '4rdsw3', 'r': '5tfde4', 't': '6zgfr5', 'z': '7uhgt6', 'u': '8ijhz7', 'i': '9okju8', 'o': '0plki9', 'p': 'lo0',
+		'a': 'qwsy', 's': 'edxyaw', 'd': 'rfcxse', 'f': 'tgvcdr', 'g': 'zhbvft', 'h': 'ujnbgz', 'j': 'ikmnhu', 'k': 'olmji', 'l': 'kop',
+		'y': 'asx', 'x': 'ysdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhjm', 'm': 'njk'
+	}
+	azerty = {
+		'1': '2a', '2': '3za1', '3': '4ez2', '4': '5re3', '5': '6tr4', '6': '7yt5', '7': '8uy6', '8': '9iu7', '9': '0oi8', '0': 'po9',
+		'a': '2zq1', 'z': '3esqa2', 'e': '4rdsz3', 'r': '5tfde4', 't': '6ygfr5', 'y': '7uhgt6', 'u': '8ijhy7', 'i': '9okju8', 'o': '0plki9', 'p': 'lo0m',
+		'q': 'zswa', 's': 'edxwqz', 'd': 'rfcxse', 'f': 'tgvcdr', 'g': 'yhbvft', 'h': 'ujnbgy', 'j': 'iknhu', 'k': 'olji', 'l': 'kopm', 'm': 'lp',
+		'w': 'sxq', 'x': 'wsdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhj'
+	}
+	keyboards = [qwerty, qwertz, azerty]
+
 	def __init__(self, domain, dictionary=[], tld_dictionary=[]):
 		self.subdomain, self.domain, self.tld = domain_tld(domain)
 		self.domain = idna.decode(self.domain)
 		self.dictionary = list(dictionary)
 		self.tld_dictionary = list(tld_dictionary)
 		self.domains = set()
-		self.qwerty = {
-			'1': '2q', '2': '3wq1', '3': '4ew2', '4': '5re3', '5': '6tr4', '6': '7yt5', '7': '8uy6', '8': '9iu7', '9': '0oi8', '0': 'po9',
-			'q': '12wa', 'w': '3esaq2', 'e': '4rdsw3', 'r': '5tfde4', 't': '6ygfr5', 'y': '7uhgt6', 'u': '8ijhy7', 'i': '9okju8', 'o': '0plki9', 'p': 'lo0',
-			'a': 'qwsz', 's': 'edxzaw', 'd': 'rfcxse', 'f': 'tgvcdr', 'g': 'yhbvft', 'h': 'ujnbgy', 'j': 'ikmnhu', 'k': 'olmji', 'l': 'kop',
-			'z': 'asx', 'x': 'zsdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhjm', 'm': 'njk'
-			}
-		self.qwertz = {
-			'1': '2q', '2': '3wq1', '3': '4ew2', '4': '5re3', '5': '6tr4', '6': '7zt5', '7': '8uz6', '8': '9iu7', '9': '0oi8', '0': 'po9',
-			'q': '12wa', 'w': '3esaq2', 'e': '4rdsw3', 'r': '5tfde4', 't': '6zgfr5', 'z': '7uhgt6', 'u': '8ijhz7', 'i': '9okju8', 'o': '0plki9', 'p': 'lo0',
-			'a': 'qwsy', 's': 'edxyaw', 'd': 'rfcxse', 'f': 'tgvcdr', 'g': 'zhbvft', 'h': 'ujnbgz', 'j': 'ikmnhu', 'k': 'olmji', 'l': 'kop',
-			'y': 'asx', 'x': 'ysdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhjm', 'm': 'njk'
-			}
-		self.azerty = {
-			'1': '2a', '2': '3za1', '3': '4ez2', '4': '5re3', '5': '6tr4', '6': '7yt5', '7': '8uy6', '8': '9iu7', '9': '0oi8', '0': 'po9',
-			'a': '2zq1', 'z': '3esqa2', 'e': '4rdsz3', 'r': '5tfde4', 't': '6ygfr5', 'y': '7uhgt6', 'u': '8ijhy7', 'i': '9okju8', 'o': '0plki9', 'p': 'lo0m',
-			'q': 'zswa', 's': 'edxwqz', 'd': 'rfcxse', 'f': 'tgvcdr', 'g': 'yhbvft', 'h': 'ujnbgy', 'j': 'iknhu', 'k': 'olji', 'l': 'kopm', 'm': 'lp',
-			'w': 'sxq', 'x': 'wsdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhj'
-			}
-		self.keyboards = [self.qwerty, self.qwertz, self.azerty]
-		self.glyphs = {
-			'0': ['o'],
-			'1': ['l', 'i'],
-			'2': ['ƻ'],
-			'3': ['8'],
-			'5': ['ƽ'],
-			'6': ['9'],
-			'8': ['3'],
-			'9': ['6'],
-			'a': ['à', 'á', 'à', 'â', 'ã', 'ä', 'å', 'ɑ', 'ạ', 'ǎ', 'ă', 'ȧ', 'ą', 'ə'],
-			'b': ['d', 'lb', 'ʙ', 'ɓ', 'ḃ', 'ḅ', 'ḇ', 'ƅ'],
-			'c': ['e', 'ƈ', 'ċ', 'ć', 'ç', 'č', 'ĉ', 'ᴄ'],
-			'd': ['b', 'cl', 'dl', 'ɗ', 'đ', 'ď', 'ɖ', 'ḑ', 'ḋ', 'ḍ', 'ḏ', 'ḓ'],
-			'e': ['c', 'é', 'è', 'ê', 'ë', 'ē', 'ĕ', 'ě', 'ė', 'ẹ', 'ę', 'ȩ', 'ɇ', 'ḛ'],
-			'f': ['ƒ', 'ḟ'],
-			'g': ['q', 'ɢ', 'ɡ', 'ġ', 'ğ', 'ǵ', 'ģ', 'ĝ', 'ǧ', 'ǥ'],
-			'h': ['lh', 'ĥ', 'ȟ', 'ħ', 'ɦ', 'ḧ', 'ḩ', 'ⱨ', 'ḣ', 'ḥ', 'ḫ', 'ẖ'],
-			'i': ['1', 'l', 'í', 'ì', 'ï', 'ı', 'ɩ', 'ǐ', 'ĭ', 'ỉ', 'ị', 'ɨ', 'ȋ', 'ī', 'ɪ'],
-			'j': ['ʝ', 'ǰ', 'ɉ', 'ĵ'],
-			'k': ['lk', 'ik', 'lc', 'ḳ', 'ḵ', 'ⱪ', 'ķ', 'ᴋ'],
-			'l': ['1', 'i', 'ɫ', 'ł'],
-			'm': ['n', 'nn', 'rn', 'rr', 'ṁ', 'ṃ', 'ᴍ', 'ɱ', 'ḿ'],
-			'n': ['m', 'r', 'ń', 'ṅ', 'ṇ', 'ṉ', 'ñ', 'ņ', 'ǹ', 'ň', 'ꞑ'],
-			'o': ['0', 'ȯ', 'ọ', 'ỏ', 'ơ', 'ó', 'ö', 'ᴏ'],
-			'p': ['ƿ', 'ƥ', 'ṕ', 'ṗ'],
-			'q': ['g', 'ʠ'],
-			'r': ['ʀ', 'ɼ', 'ɽ', 'ŕ', 'ŗ', 'ř', 'ɍ', 'ɾ', 'ȓ', 'ȑ', 'ṙ', 'ṛ', 'ṟ'],
-			's': ['ʂ', 'ś', 'ṣ', 'ṡ', 'ș', 'ŝ', 'š', 'ꜱ'],
-			't': ['ţ', 'ŧ', 'ṫ', 'ṭ', 'ț', 'ƫ'],
-			'u': ['ᴜ', 'ǔ', 'ŭ', 'ü', 'ʉ', 'ù', 'ú', 'û', 'ũ', 'ū', 'ų', 'ư', 'ů', 'ű', 'ȕ', 'ȗ', 'ụ'],
-			'v': ['ṿ', 'ⱱ', 'ᶌ', 'ṽ', 'ⱴ', 'ᴠ'],
-			'w': ['vv', 'ŵ', 'ẁ', 'ẃ', 'ẅ', 'ⱳ', 'ẇ', 'ẉ', 'ẘ', 'ᴡ'],
-			'x': ['ẋ', 'ẍ'],
-			'y': ['ʏ', 'ý', 'ÿ', 'ŷ', 'ƴ', 'ȳ', 'ɏ', 'ỿ', 'ẏ', 'ỵ'],
-			'z': ['ʐ', 'ż', 'ź', 'ᴢ', 'ƶ', 'ẓ', 'ẕ', 'ⱬ']
-			}
 
 	def _bitsquatting(self):
 		masks = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -435,17 +670,27 @@ class Fuzzer():
 				if b in chars:
 					yield self.domain[:i] + b + self.domain[i+1:]
 
+	def _cyrillic(self):
+		cdomain = self.domain
+		for l, c in self.latin_to_cyrillic.items():
+			cdomain = cdomain.replace(l, c)
+		for c, l in zip(cdomain, self.domain):
+			if c == l:
+				return []
+		return [cdomain]
+
 	def _homoglyph(self):
+		md = lambda a, b: {k: set(a.get(k, [])) | set(b.get(k, [])) for k in set(a.keys()) | set(b.keys())}
+		glyphs = md(self.glyphs_ascii, self.glyphs_idn_by_tld.get(self.tld, self.glyphs_unicode))
 		def mix(domain):
-			glyphs = self.glyphs
-			for w in range(1, len(domain)):
-				for i in range(len(domain)-w+1):
-					pre = domain[:i]
-					win = domain[i:i+w]
-					suf = domain[i+w:]
-					for c in win:
-						for g in glyphs.get(c, []):
-							yield pre + win.replace(c, g) + suf
+			for i, c in enumerate(domain):
+				for g in glyphs.get(c, []):
+					yield domain[:i] + g + domain[i+1:]
+			for i in range(len(domain)-1):
+				win = domain[i:i+2]
+				for c in {win[0], win[1], win}:
+					for g in glyphs.get(c, []):
+						yield domain[:i] + win.replace(c, g) + domain[i+2:]
 		result1 = set(mix(self.domain))
 		result2 = set()
 		for r in result1:
@@ -522,28 +767,37 @@ class Fuzzer():
 			self.tld_dictionary.remove(self.tld)
 		return set(self.tld_dictionary)
 
-	def generate(self):
-		self.domains.add(Permutation(fuzzer='*original', domain='.'.join(filter(None, [self.subdomain, self.domain, self.tld]))))
-		for f_name in [
-			'addition', 'bitsquatting', 'homoglyph', 'hyphenation',
+	def generate(self, fuzzers=[]):
+		if not fuzzers or '*original' in fuzzers:
+			self.domains.add(Permutation(fuzzer='*original', domain='.'.join(filter(None, [self.subdomain, self.domain, self.tld]))))
+		for f_name in fuzzers or [
+			'addition', 'bitsquatting', 'cyrillic', 'homoglyph', 'hyphenation',
 			'insertion', 'omission', 'repetition', 'replacement',
 			'subdomain', 'transposition', 'vowel-swap', 'dictionary',
 		]:
-			f = getattr(self, '_' + f_name.replace('-', '_'))
-			for domain in f():
-				self.domains.add(Permutation(fuzzer=f_name, domain='.'.join(filter(None, [self.subdomain, domain, self.tld]))))
-		for tld in self._tld():
-			self.domains.add(Permutation(fuzzer='tld-swap', domain='.'.join(filter(None, [self.subdomain, self.domain, tld]))))
-		if '.' in self.tld:
-			self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain, self.tld.split('.')[-1]]))))
-			self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain + self.tld]))))
-		if '.' not in self.tld:
-			self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain + self.tld, self.tld]))))
-		if self.tld != 'com' and '.' not in self.tld:
-			self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain + '-' + self.tld, 'com']))))
-		if self.subdomain:
-			self.domains.add(Permutation(fuzzer='various', domain='.'.join([self.subdomain + self.domain, self.tld])))
-			self.domains.add(Permutation(fuzzer='various', domain='.'.join([self.subdomain + '-' + self.domain, self.tld])))
+			try:
+				f = getattr(self, '_' + f_name.replace('-', '_'))
+			except AttributeError:
+				pass
+			else:
+				for domain in f():
+					self.domains.add(Permutation(fuzzer=f_name, domain='.'.join(filter(None, [self.subdomain, domain, self.tld]))))
+		if not fuzzers or 'tld-swap' in fuzzers:
+			for tld in self._tld():
+				self.domains.add(Permutation(fuzzer='tld-swap', domain='.'.join(filter(None, [self.subdomain, self.domain, tld]))))
+		if not fuzzers or 'various' in fuzzers:
+			if '.' in self.tld:
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain, self.tld.split('.')[-1]]))))
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain + self.tld]))))
+			if '.' not in self.tld:
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain + self.tld, self.tld]))))
+			if self.tld != 'com' and '.' not in self.tld:
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join(filter(None, [self.subdomain, self.domain + '-' + self.tld, 'com']))))
+			if self.subdomain:
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join([self.subdomain + self.domain, self.tld])))
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join([self.subdomain.replace('.', '') + self.domain, self.tld])))
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join([self.subdomain + '-' + self.domain, self.tld])))
+				self.domains.add(Permutation(fuzzer='various', domain='.'.join([self.subdomain.replace('.', '-') + '-' + self.domain, self.tld])))
 		def _punycode(domain):
 			try:
 				domain['domain'] = idna.encode(domain['domain']).decode()
@@ -574,57 +828,58 @@ class Scanner(threading.Thread):
 	def __init__(self, queue):
 		threading.Thread.__init__(self)
 		self._stop_event = threading.Event()
+		self.daemon = True
 		self.id = 0
 		self.jobs = queue
-		self.debug = False
-		self.ssdeep_init = ''
-		self.ssdeep_effective_url = ''
+		self.lsh_init = ''
+		self.lsh_effective_url = ''
 		self.phash_init = None
 		self.screenshot_dir = None
 		self.url = None
 		self.option_extdns = False
 		self.option_geoip = False
-		self.option_ssdeep = False
+		self.option_lsh = None
 		self.option_phash = False
 		self.option_banners = False
 		self.option_mxcheck = False
 		self.nameservers = []
 		self.useragent = ''
 
-	def _debug(self, text):
-		if self.debug:
-			print(str(text), file=sys.stderr, flush=True)
+	@staticmethod
+	def _send_recv_tcp(host, port, data=b'', timeout=2.0, recv_bytes=1024):
+		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		sock.settimeout(timeout)
+		resp = b''
+		try:
+			sock.connect((host, port))
+			if data:
+				sock.send(data)
+			resp = sock.recv(recv_bytes)
+		except Exception as e:
+			_debug(e)
+		finally:
+			sock.close()
+		return resp.decode('utf-8', errors='ignore')
 
 	def _banner_http(self, ip, vhost):
-		try:
-			http = socket.socket()
-			http.settimeout(1)
-			http.connect((ip, 80))
-			http.send('HEAD / HTTP/1.1\r\nHost: {}\r\nUser-agent: {}\r\n\r\n'.format(vhost, self.useragent).encode())
-			response = http.recv(1024).decode()
-			http.close()
-		except Exception:
-			pass
-		else:
-			headers = response.splitlines()
-			for field in headers:
-				if field.lower().startswith('server: '):
-					return field[8:]
+		response = self._send_recv_tcp(ip, 80,
+			'HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n'.format(vhost, self.useragent).encode())
+		if not response:
+			return ''
+		headers = response.splitlines()
+		for field in headers:
+			if field.lower().startswith('server: '):
+				return field[8:]
+		return ''
 
 	def _banner_smtp(self, mx):
-		try:
-			smtp = socket.socket()
-			smtp.settimeout(1)
-			smtp.connect((mx, 25))
-			response = smtp.recv(1024).decode()
-			smtp.close()
-		except Exception:
-			pass
-		else:
-			hello = response.splitlines()[0]
-			if hello.startswith('220'):
-				return hello[4:].strip()
-			return hello[:40]
+		response = self._send_recv_tcp(mx, 25)
+		if not response:
+			return ''
+		hello = response.splitlines()[0]
+		if hello.startswith('220'):
+			return hello[4:].strip()
+		return ''
 
 	def _mxcheck(self, mx, from_domain, to_domain):
 		from_addr = 'randombob1986@' + from_domain
@@ -657,6 +912,7 @@ class Scanner(threading.Thread):
 			resolv.timeout = REQUEST_TIMEOUT_DNS
 			EDNS_PAYLOAD = 1232
 			resolv.use_edns(edns=True, ednsflags=0, payload=EDNS_PAYLOAD)
+			resolv.rotate = True
 
 			if hasattr(resolv, 'resolve'):
 				resolve = resolv.resolve
@@ -695,7 +951,7 @@ class Scanner(threading.Thread):
 				except NoNameservers:
 					task['dns_ns'] = ['!ServFail']
 				except DNSException as e:
-					self._debug(e)
+					_debug(e)
 
 				if nxdomain is False:
 					try:
@@ -704,7 +960,7 @@ class Scanner(threading.Thread):
 					except NoNameservers:
 						task['dns_a'] = ['!ServFail']
 					except DNSException as e:
-						self._debug(e)
+						_debug(e)
 
 					try:
 						task['dns_aaaa'] = _answer_to_list(resolve(domain, rdtype=dns.rdatatype.AAAA))
@@ -712,7 +968,7 @@ class Scanner(threading.Thread):
 					except NoNameservers:
 						task['dns_aaaa'] = ['!ServFail']
 					except DNSException as e:
-						self._debug(e)
+						_debug(e)
 
 				if nxdomain is False and dns_ns is True:
 					try:
@@ -721,7 +977,7 @@ class Scanner(threading.Thread):
 					except NoNameservers:
 						task['dns_mx'] = ['!ServFail']
 					except DNSException as e:
-						self._debug(e)
+						_debug(e)
 			else:
 				try:
 					addrinfo = socket.getaddrinfo(domain, None, proto=socket.IPPROTO_TCP)
@@ -729,7 +985,7 @@ class Scanner(threading.Thread):
 					if e.errno == -3:
 						task['dns_a'] = ['!ServFail']
 				except Exception as e:
-					self._debug(e)
+					_debug(e)
 				else:
 					for _, _, _, _, sa in addrinfo:
 						ip = sa[0]
@@ -759,7 +1015,7 @@ class Scanner(threading.Thread):
 					try:
 						country = geo.country_by_addr(task['dns_a'][0])
 					except Exception as e:
-						self._debug(e)
+						_debug(e)
 						pass
 					else:
 						if country:
@@ -781,7 +1037,7 @@ class Scanner(threading.Thread):
 						browser.get(self.url.full_uri(domain))
 						screenshot = browser.screenshot()
 					except Exception as e:
-						self._debug(e)
+						_debug(e)
 					else:
 						if self.option_phash:
 							phash = pHash(BytesIO(screenshot))
@@ -792,24 +1048,27 @@ class Scanner(threading.Thread):
 								with open(filename, 'wb') as f:
 									f.write(screenshot)
 							except Exception as e:
-								self._debug(e)
+								_debug(e)
 
-			if self.option_ssdeep:
+			if self.option_lsh:
 				if dns_a is True or dns_aaaa is True:
 					try:
 						r = UrlOpener(self.url.full_uri(domain),
 							timeout=REQUEST_TIMEOUT_HTTP,
-							headers={'User-Agent': self.useragent,
-								'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
-								'Accept-Encoding': 'gzip,identity',
-								'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8'},
+							headers={'user-agent': self.useragent},
 							verify=False)
 					except Exception as e:
-						self._debug(e)
+						_debug(e)
 					else:
-						if r.url.split('?')[0] != self.ssdeep_effective_url:
-							ssdeep_curr = ssdeep.hash(r.normalized_content)
-							task['ssdeep'] = ssdeep.compare(self.ssdeep_init, ssdeep_curr)
+						if r.url.split('?')[0] != self.lsh_effective_url:
+							if self.option_lsh == 'ssdeep':
+								lsh_curr = ssdeep.hash(r.normalized_content)
+								if lsh_curr not in (None, '3::'):
+									task['ssdeep'] = ssdeep.compare(self.lsh_init, lsh_curr)
+							elif self.option_lsh == 'tlsh':
+								lsh_curr = tlsh.hash(r.normalized_content)
+								if lsh_curr not in (None, '', 'TNULL'):
+									task['tlsh'] = int(100 - (min(tlsh.diff(self.lsh_init, lsh_curr), 300)/3))
 
 			self.jobs.task_done()
 
@@ -875,6 +1134,8 @@ class Format():
 				inf.append(kv('CREATED:', domain['whois_created']))
 			if domain.get('ssdeep', 0) > 0:
 				inf.append(kv('SSDEEP:', '{}%'.format(domain['ssdeep'])))
+			if domain.get('tlsh', 0) > 0:
+				inf.append(kv('TLSH:', '{}%'.format(domain['tlsh'])))
 			if domain.get('phash', 0) > 0:
 				inf.append(kv('PHASH:', '{}%'.format(domain['phash'])))
 			cli.append('{}{[fuzzer]:<{}}{} {[domain]:<{}} {}'.format(FG_BLU, domain, wfuz, FG_RST, domain, wdom, ' '.join(inf or ['-'])))
@@ -904,28 +1165,31 @@ def run(**kwargs):
 		)
 
 	parser.add_argument('domain', help='Domain name or URL to scan')
-	parser.add_argument('-a', '--all', action='store_true', help='Show all DNS records')
+	parser.add_argument('-a', '--all', action='store_true', help='Print all DNS records instead of the first ones')
 	parser.add_argument('-b', '--banners', action='store_true', help='Determine HTTP and SMTP service banners')
 	parser.add_argument('-d', '--dictionary', type=str, metavar='FILE', help='Generate more domains using dictionary FILE')
 	parser.add_argument('-f', '--format', type=str, default='cli', help='Output format: cli, csv, json, list (default: cli)')
+	parser.add_argument('--fuzzers', type=str, metavar='LIST', help='Use only selected fuzzing algorithms (separated with commas)')
 	parser.add_argument('-g', '--geoip', action='store_true', help='Lookup for GeoIP location')
-	parser.add_argument('-m', '--mxcheck', action='store_true', help='Check if MX can be used to intercept emails')
+	parser.add_argument('--lsh', type=str, metavar='LSH', nargs='?', const='ssdeep',
+		help='Evaluate web page similarity with LSH algorithm: ssdeep, tlsh (default: ssdeep)')
+	parser.add_argument('--lsh-url', metavar='URL', help='Override URL to fetch the original web page from')
+	parser.add_argument('-m', '--mxcheck', action='store_true', help='Check if MX host can be used to intercept emails')
 	parser.add_argument('-o', '--output', type=str, metavar='FILE', help='Save output to FILE')
 	parser.add_argument('-r', '--registered', action='store_true', help='Show only registered domain names')
 	parser.add_argument('-u', '--unregistered', action='store_true', help='Show only unregistered domain names')
 	parser.add_argument('-p', '--phash', action='store_true', help='Render web pages and evaluate visual similarity')
 	parser.add_argument('--phash-url', metavar='URL', help='Override URL to render the original web page from')
 	parser.add_argument('--screenshots', metavar='DIR', help='Save web page screenshots into DIR')
-	parser.add_argument('-s', '--ssdeep', action='store_true', help='Fetch web pages and compare their fuzzy hashes to evaluate similarity')
-	parser.add_argument('--ssdeep-url', metavar='URL', help='Override URL to fetch the original web page from')
-	parser.add_argument('-t', '--threads', type=int, metavar='NUMBER', default=THREAD_COUNT_DEFAULT,
-		help='Start specified NUMBER of threads (default: %s)' % THREAD_COUNT_DEFAULT)
-	parser.add_argument('-w', '--whois', action='store_true', help='Lookup WHOIS database for creation date')
+	parser.add_argument('-s', '--ssdeep', action='store_true', help=argparse.SUPPRESS)
+	parser.add_argument('--ssdeep-url', help=argparse.SUPPRESS)
+	parser.add_argument('-t', '--threads', type=int, metavar='NUM', default=THREAD_COUNT_DEFAULT,
+		help='Start specified NUM of threads (default: %s)' % THREAD_COUNT_DEFAULT)
+	parser.add_argument('-w', '--whois', action='store_true', help='Lookup WHOIS database for creation date and registrar')
 	parser.add_argument('--tld', type=str, metavar='FILE', help='Swap TLD for the original domain from FILE')
 	parser.add_argument('--nameservers', type=str, metavar='LIST', help='DNS or DoH servers to query (separated with commas)')
 	parser.add_argument('--useragent', type=str, metavar='STRING', default=USER_AGENT_STRING,
-		help='User-Agent STRING to send with HTTP requests (default: %s)' % USER_AGENT_STRING)
-	parser.add_argument('--debug', action='store_true', help='Display debug messages')
+		help='Set User-Agent STRING (default: %s)' % USER_AGENT_STRING)
 
 	if kwargs:
 		sys.argv = ['']
@@ -958,7 +1222,7 @@ def run(**kwargs):
 
 	def signal_handler(signal, frame):
 		if threads:
-			print('\nStopping threads... ', file=sys.stderr, flush=True)
+			print('\nstopping threads... ', file=sys.stderr, flush=True)
 			jobs.queue.clear()
 			for worker in threads:
 				worker.stop()
@@ -969,11 +1233,38 @@ def run(**kwargs):
 	if args.registered and args.unregistered:
 		parser.error('arguments --registered and --unregistered are mutually exclusive')
 
+	if args.ssdeep:
+		p_err('WARNING: argument --ssdeep is deprecated, use --lsh ssdeep instead')
+		args.lsh = 'ssdeep'
+	if args.ssdeep_url:
+		p_err('WARNING: argument --ssdeep-url is deprecated, use --lsh-url instead')
+		args.lsh_url = args.ssdeep_url
+
+	if not args.lsh and args.lsh_url:
+		parser.error('argument --lsh-url requires --lsh')
+
+	if args.lsh and args.lsh not in ('ssdeep', 'tlsh'):
+		parser.error('invalid LSH algorithm (choose ssdeep or tlash)')
+
+	if not args.phash:
+		if args.phash_url:
+			parser.error('argument --phash-url requires --phash')
+		if args.screenshots:
+			parser.error('argument --screenshots requires --phash')
+
 	if not kwargs and args.format not in ('cli', 'csv', 'json', 'list'):
 		parser.error('invalid output format (choose from cli, csv, json, list)')
 
 	if args.threads < 1:
 		parser.error('number of threads must be greater than zero')
+
+	fuzzers = []
+	if args.fuzzers:
+		fuzzers = [x.strip().lower() for x in set(args.fuzzers.split(','))]
+		if args.dictionary and 'dictionary' not in fuzzers:
+			parser.error('argument --dictionary cannot be used with selected fuzzing algorithms (consider enabling fuzzer: dictionary)')
+		if args.tld and 'tld-swap' not in fuzzers:
+			parser.error('argument --tld cannot be used with selected fuzzing algorithms (consider enabling fuzzer: tld-swap)')
 
 	nameservers = []
 	if args.nameservers:
@@ -995,21 +1286,36 @@ def run(**kwargs):
 
 	dictionary = []
 	if args.dictionary:
-		if not os.path.exists(args.dictionary):
-			parser.error('dictionary file not found: %s' % args.dictionary)
-		with open(args.dictionary) as f:
-			dictionary = [x for x in set(f.read().splitlines()) if x.isalnum()]
+		try:
+			with open(args.dictionary, encoding='utf-8') as f:
+				dictionary = [x for x in set(f.read().splitlines()) if x.isalnum()]
+		except FileNotFoundError:
+			parser.error('file not found: {}'.format(args.dictionary))
+		except PermissionError:
+			parser.error('permission denied: {}'.format(args.dictionary))
+		except UnicodeDecodeError:
+			parser.error('UTF-8 decode error when reading: {}'.format(args.dictionary))
+		except OSError as err:
+			parser.error(err)
 
 	tld = []
 	if args.tld:
-		if not os.path.exists(args.tld):
-			parser.error('dictionary file not found: %s' % args.tld)
-		with open(args.tld) as f:
-			tld = [x for x in set(f.read().splitlines()) if re.match(r'^[a-z0-9-]{2,63}(\.[a-z0-9-]{2,63}){0,1}$', x)]
+		try:
+			with open(args.tld, encoding='utf-8') as f:
+				tld = [x for x in set(f.read().splitlines()) if re.match(r'^[a-z0-9-]{2,63}(\.[a-z0-9-]{2,63}){0,1}$', x)]
+		except FileNotFoundError:
+			parser.error('file not found: {}'.format(args.tld))
+		except PermissionError:
+			parser.error('permission denied: {}'.format(args.tld))
+		except UnicodeDecodeError:
+			parser.error('UTF-8 decode error when reading: {}'.format(args.tld))
+		except OSError as err:
+			parser.error(err)
 
 	if args.output:
+		sys._stdout = sys.stdout
 		try:
-			sys.stdout = open(args.output, 'x')
+			sys.stdout = open(args.output, 'w' if args.output == os.devnull else 'x')
 		except FileExistsError:
 			parser.error('file already exists: %s' % args.output)
 		except FileNotFoundError:
@@ -1017,15 +1323,17 @@ def run(**kwargs):
 		except PermissionError:
 			parser.error('permission denied: %s' % args.output)
 
-	ssdeep_url = None
-	if args.ssdeep:
-		if not MODULE_SSDEEP:
+	lsh_url = None
+	if args.lsh:
+		if args.lsh == 'ssdeep' and not MODULE_SSDEEP:
 			parser.error('missing ssdeep library')
-		if args.ssdeep_url:
+		if args.lsh == 'tlsh' and not MODULE_TLSH:
+			parser.error('missing py-tlsh library')
+		if args.lsh_url:
 			try:
-				ssdeep_url = UrlParser(args.ssdeep_url)
+				lsh_url = UrlParser(args.lsh_url)
 			except ValueError:
-				parser.error('invalid domain name: ' + args.ssdeep_url)
+				parser.error('invalid domain name: ' + args.lsh_url)
 
 	phash_url = None
 	if args.phash or args.screenshots:
@@ -1046,13 +1354,9 @@ def run(**kwargs):
 			except ValueError:
 				parser.error('invalid domain name: ' + args.phash_url)
 
-	if args.whois:
-		if not MODULE_WHOIS:
-			parser.error('missing whois library')
-
 	if args.geoip:
 		if not MODULE_GEOIP:
-			parser.error('missing GeoIP library or database')
+			parser.error('missing geoip2 library or database file (check $GEOLITE2_MMDB environment variable)')
 
 	try:
 		url = UrlParser(args.domain)
@@ -1064,12 +1368,17 @@ def run(**kwargs):
 			signal.signal(sig, signal_handler)
 
 	fuzz = Fuzzer(url.domain, dictionary=dictionary, tld_dictionary=tld)
-	fuzz.generate()
+	fuzz.generate(fuzzers=fuzzers)
 	domains = fuzz.domains
+
+	if not domains:
+		parser.error('selected fuzzing algorithms do not generate any permutations for provided input domain')
 
 	if args.format == 'list':
 		print(Format(domains).list())
-		return domains
+		if hasattr(sys, '_stdout'):
+			sys.stdout = sys._stdout
+		return list(map(dict, domains)) if kwargs else None
 
 	if not MODULE_DNSPYTHON:
 		p_err('WARNING: DNS features are limited due to lack of DNSPython library')
@@ -1083,32 +1392,35 @@ r'''     _           _            _     _
 
 ''' % __version__ + FG_RST + ST_RST)
 
-	ssdeep_init = str()
-	ssdeep_effective_url = str()
-	if args.ssdeep:
-		request_url = ssdeep_url.full_uri() if ssdeep_url else url.full_uri()
-		p_cli('Fetching content from: %s ' % request_url)
+	lsh_init = str()
+	lsh_effective_url = str()
+	if args.lsh:
+		request_url = lsh_url.full_uri() if lsh_url else url.full_uri()
+		p_cli('fetching content from: {} '.format(request_url))
 		try:
 			r = UrlOpener(request_url,
 				timeout=REQUEST_TIMEOUT_HTTP,
-				headers={'User-Agent': args.useragent,
-					'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
-					'Accept-Encoding': 'gzip,identity',
-					'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8'},
+				headers={'User-Agent': args.useragent},
 				verify=True)
 		except Exception as e:
 			if kwargs:
 				raise
-			p_cli('{}\n'.format(str(e)))
+			p_err(e)
 			sys.exit(1)
 		else:
 			p_cli('> {} [{:.1f} KB]\n'.format(r.url.split('?')[0], len(r.content)/1024))
-			ssdeep_init = ssdeep.hash(r.normalized_content)
-			ssdeep_effective_url = r.url.split('?')[0]
+			if args.lsh == 'ssdeep':
+				lsh_init = ssdeep.hash(r.normalized_content)
+			elif args.lsh == 'tlsh':
+				lsh_init = tlsh.hash(r.normalized_content)
+			lsh_effective_url = r.url.split('?')[0]
+			# hash blank if content too short or insufficient entropy
+			if lsh_init in (None, '', 'TNULL', '3::'):
+				args.lsh = None
 
 	if args.phash:
 		request_url = phash_url.full_uri() if phash_url else url.full_uri()
-		p_cli('Rendering web page: {}\n'.format(request_url))
+		p_cli('rendering web page: {}\n'.format(request_url))
 		browser = HeadlessBrowser(useragent=args.useragent)
 		try:
 			browser.get(request_url)
@@ -1116,7 +1428,7 @@ r'''     _           _            _     _
 		except Exception as e:
 			if kwargs:
 				raise
-			p_cli('{}\n'.format(str(e)))
+			p_err(e)
 			sys.exit(1)
 		else:
 			phash = pHash(BytesIO(screenshot))
@@ -1128,7 +1440,6 @@ r'''     _           _            _     _
 	sid = int.from_bytes(os.urandom(4), sys.byteorder)
 	for _ in range(args.threads):
 		worker = Scanner(jobs)
-		worker.daemon = True
 		worker.id = sid
 		worker.url = url
 		worker.option_extdns = MODULE_DNSPYTHON
@@ -1136,10 +1447,10 @@ r'''     _           _            _     _
 			worker.option_geoip = True
 		if args.banners:
 			worker.option_banners = True
-		if args.ssdeep and ssdeep_init:
-			worker.option_ssdeep = True
-			worker.ssdeep_init = ssdeep_init
-			worker.ssdeep_effective_url = ssdeep_effective_url
+		if args.lsh and lsh_init:
+			worker.option_lsh = args.lsh
+			worker.lsh_init = lsh_init
+			worker.lsh_effective_url = lsh_effective_url
 		if args.phash:
 			worker.option_phash = True
 			worker.phash_init = phash
@@ -1149,47 +1460,52 @@ r'''     _           _            _     _
 		if args.nameservers:
 			worker.nameservers = nameservers
 		worker.useragent = args.useragent
-		worker.debug = args.debug
 		worker.start()
 		threads.append(worker)
 
+	p_cli('started {} scanner threads\n'.format(args.threads))
+
 	ttime = 0
-	ival = 0.5
-	while not jobs.empty():
+	ival = 0.2
+	while True:
 		time.sleep(ival)
 		ttime += ival
-		comp = len(domains) - jobs.qsize()
+		dlen = len(domains)
+		comp = dlen - jobs.qsize()
 		if not comp:
 			continue
-		perc = 100 * comp / len(domains)
-		rate = comp / ttime
-		eta = int(jobs.qsize() / rate)
+		rate = int(comp / ttime) + 1
+		eta = jobs.qsize() // rate
 		found = sum([1 for x in domains if x.is_registered()])
-		p_cli('\rPermutations: {:.2f}% of {}, Found: {}, ETA: {} [{:3.0f} qps]'.format(perc, len(domains), found, time.strftime('%M:%S', time.gmtime(eta)), rate))
+		p_cli(ST_CLR + '\rpermutations: {:.2%} of {} | found: {} | eta: {:d}m {:02d}s | speed: {:d} qps'.format(comp/dlen,
+			dlen, found, eta//60, eta%60, rate))
+		if jobs.empty():
+			break
+		if sum([1 for x in threads if x.is_alive()]) == 0:
+			break
 	p_cli('\n')
 
 	for worker in threads:
 		worker.stop()
+	for worker in threads:
+		worker.join()
 
 	domains = fuzz.permutations(registered=args.registered, unregistered=args.unregistered, dns_all=args.all)
 
 	if args.whois:
 		total = sum([1 for x in domains if x.is_registered()])
+		whois = Whois()
 		for i, domain in enumerate([x for x in domains if x.is_registered()]):
-			p_cli('\rWHOIS: {:.2f}% of {}'.format(100*(i+1)/total, total))
+			p_cli(ST_CLR + '\rWHOIS: {} ({:.2%})'.format(domain['domain'], (i+1)/total))
 			try:
-				_, dom, tld = domain_tld(domain['domain'])
-				whoisq = whois.query('.'.join([dom, tld]))
+				wreply = whois.whois('.'.join(domain_tld(domain['domain'])[1:]))
 			except Exception as e:
-				if args.debug:
-					p_err(e)
+				_debug(e)
 			else:
-				if whoisq is None:
-					continue
-				if whoisq.creation_date:
-					domain['whois_created'] = str(whoisq.creation_date).split(' ')[0]
-				if whoisq.registrar:
-					domain['whois_registrar'] = str(whoisq.registrar)
+				if wreply.get('creation_date'):
+					domain['whois_created'] = wreply.get('creation_date').strftime('%Y-%m-%d')
+				if wreply.get('registrar'):
+					domain['whois_registrar'] = wreply.get('registrar')
 		p_cli('\n')
 
 	p_cli('\n')
@@ -1202,8 +1518,11 @@ r'''     _           _            _     _
 		elif args.format == 'cli':
 			print(Format(domains).cli())
 
+	if hasattr(sys, '_stdout'):
+		sys.stdout = sys._stdout
+
 	if kwargs:
-		return domains
+		return list(map(dict, domains))
 
 
 if __name__ == '__main__':

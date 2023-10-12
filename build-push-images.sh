@@ -5,7 +5,7 @@ SHORT_SHA=$(git rev-parse --short HEAD)
 
 echo "Building image..."
 
-docker build -t "us.gcr.io/vendor-risk-development/dnstwist:$SHORT_SHA" .
+docker build --platform linux/amd64 -t "us.gcr.io/vendor-risk-development/dnstwist:$SHORT_SHA" .
 
 docker tag "us.gcr.io/vendor-risk-development/dnstwist:$SHORT_SHA" "us.gcr.io/vendor-risk-production/dnstwist:$SHORT_SHA"
 

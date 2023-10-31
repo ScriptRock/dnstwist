@@ -445,6 +445,10 @@ class HeadlessBrowser():
 		chrome_options = webdriver.ChromeOptions()
 		for opt in self.WEBDRIVER_ARGUMENTS:
 			chrome_options.add_argument(opt)
+		proxies = urllib.request.getproxies()
+		if proxies:
+			proxy_string = ';'.join(['{}={}'.format(scheme, url) for scheme, url in proxies.items()])
+			chrome_options.add_argument('--proxy-server={}'.format(proxy_string))
 		chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
 		chrome_options.add_experimental_option('useAutomationExtension', False)
 		self.driver = webdriver.Chrome(options=chrome_options)
@@ -740,6 +744,11 @@ class Fuzzer():
 				if self.domain[i] in vowels:
 					yield self.domain[:i] + vowel + self.domain[i+1:]
 
+	def _plural(self):
+		for i in range(2, len(self.domain)-2):
+			yield self.domain[:i+1] + ('es' if self.domain[i] in ('s', 'x', 'z') else 's') + self.domain[i+1:]
+
+
 	def _addition(self):
 		return {self.domain + chr(i) for i in (*range(48, 58), *range(97, 123))}
 
@@ -768,11 +777,12 @@ class Fuzzer():
 		return set(self.tld_dictionary)
 
 	def generate(self, fuzzers=[]):
+		self.domains = set()
 		if not fuzzers or '*original' in fuzzers:
 			self.domains.add(Permutation(fuzzer='*original', domain='.'.join(filter(None, [self.subdomain, self.domain, self.tld]))))
 		for f_name in fuzzers or [
 			'addition', 'bitsquatting', 'cyrillic', 'homoglyph', 'hyphenation',
-			'insertion', 'omission', 'repetition', 'replacement',
+			'insertion', 'omission', 'plural', 'repetition', 'replacement',
 			'subdomain', 'transposition', 'vowel-swap', 'dictionary',
 		]:
 			try:
@@ -1286,42 +1296,33 @@ def run(**kwargs):
 
 	dictionary = []
 	if args.dictionary:
+		re_subd = re.compile(r'^(?:(?:xn--)[a-z0-9-]{3,59}|[a-z0-9-]{1,63})$')
 		try:
 			with open(args.dictionary, encoding='utf-8') as f:
-				dictionary = [x for x in set(f.read().splitlines()) if x.isalnum()]
-		except FileNotFoundError:
-			parser.error('file not found: {}'.format(args.dictionary))
-		except PermissionError:
-			parser.error('permission denied: {}'.format(args.dictionary))
+				dictionary = [x for x in set(f.read().lower().splitlines()) if re_subd.match(x)]
 		except UnicodeDecodeError:
 			parser.error('UTF-8 decode error when reading: {}'.format(args.dictionary))
 		except OSError as err:
-			parser.error(err)
+			parser.error('unable to open {} ({})'.format(args.dictionary, err.strerror.lower()))
 
 	tld = []
 	if args.tld:
+		re_tld = re.compile(r'^[a-z0-9-]{2,63}(?:\.[a-z0-9-]{2,63})?$')
 		try:
 			with open(args.tld, encoding='utf-8') as f:
-				tld = [x for x in set(f.read().splitlines()) if re.match(r'^[a-z0-9-]{2,63}(\.[a-z0-9-]{2,63}){0,1}$', x)]
-		except FileNotFoundError:
-			parser.error('file not found: {}'.format(args.tld))
-		except PermissionError:
-			parser.error('permission denied: {}'.format(args.tld))
+				tld = [x for x in set(f.read().lower().splitlines()) if re_tld.match(x)]
 		except UnicodeDecodeError:
 			parser.error('UTF-8 decode error when reading: {}'.format(args.tld))
 		except OSError as err:
-			parser.error(err)
+			parser.error('unable to open {} ({})'.format(args.tld, err.strerror.lower()))
 
 	if args.output:
 		sys._stdout = sys.stdout
 		try:
 			sys.stdout = open(args.output, 'w' if args.output == os.devnull else 'x')
-		except FileExistsError:
-			parser.error('file already exists: %s' % args.output)
-		except FileNotFoundError:
-			parser.error('file not found: %s' % args.output)
-		except PermissionError:
-			parser.error('permission denied: %s' % args.output)
+		except OSError as err:
+			parser.error('unable to open {} ({})'.format(args.output, err.strerror.lower()))
+
 
 	lsh_url = None
 	if args.lsh:

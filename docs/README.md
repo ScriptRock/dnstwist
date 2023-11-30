@@ -238,6 +238,13 @@ $ dnstwist --phash --screenshots /tmp/domain domain.name
 Note: Due to the multi-threaded use of a fully functional web browser,
 an appropriate amount of free resources (mainly memory) should be provided.
 
+**Proxy support**
+
+For all HTTP connections, proxies are automatically used when the presence of
+environment variables named `$<scheme>_proxy`, in a case insensitive approach,
+is detected. If both lowercase and uppercase environment variables exist,
+lowercase is preferred.
+
 
 API
 ---
@@ -312,10 +319,11 @@ globe, as well as independent information security analysts and researchers.
 On top of this, it's integrated into products and services of many security
 providers, in particular but not only:
 
-Splunk ESCU, RecordedFuture, SpiderFoot, DigitalShadows, SecurityRisk,
-SmartFense, ThreatPipes, PaloAlto Cortex XSOAR, Rapid7 InsightConnect SOAR,
-Mimecast, Watcher, Intel Owl, PatrOwl, VDA Labs, Appsecco, Maltego,
-Conscia ThreatInsights, Fortinet FortiSOAR, ThreatConnect, CISA Crossfeed.
+[Splunk add-on](https://splunkbase.splunk.com/app/7123), RecordedFuture,
+SpiderFoot, DigitalShadows, SecurityRisk, SmartFense, ThreatPipes,
+PaloAlto Cortex XSOAR, Rapid7 InsightConnect SOAR, Mimecast, Watcher,
+Intel Owl, PatrOwl, VDA Labs, Appsecco, Maltego, Conscia ThreatInsights,
+Fortinet FortiSOAR, ThreatConnect, CISA Crossfeed.
 
 
 Contact

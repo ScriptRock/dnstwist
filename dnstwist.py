@@ -706,7 +706,7 @@ class Fuzzer():
 
 	def _insertion(self):
 		result = set()
-		for i in range(1, len(self.domain)-1):
+		for i in range(0, len(self.domain)-1):
 			prefix, orig_c, suffix = self.domain[:i], self.domain[i], self.domain[i+1:]
 			for c in (c for keys in self.keyboards for c in keys.get(orig_c, [])):
 				result.update({
@@ -1392,6 +1392,11 @@ r'''     _           _            _     _
  \__,_|_| |_|___/\__| \_/\_/ |_|___/\__| {%s}
 
 ''' % __version__ + FG_RST + ST_RST)
+
+	if args.lsh or args.phash:
+		proxies = urllib.request.getproxies()
+		if proxies:
+			p_cli('using proxy: {}\n'.format(' '.join(set(proxies.values()))))
 
 	lsh_init = str()
 	lsh_effective_url = str()

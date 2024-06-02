@@ -73,6 +73,12 @@ $ sudo apt install dnstwist
 $ sudo dnf install dnstwist
 ```
 
+**Arch Linux User Repository (yay)**
+
+```
+$ yay -S dnstwist
+```
+
 **macOS**
 
 This will install `dnstwist` along with all dependencies, and the binary will
@@ -134,10 +140,8 @@ $ dnstwist --tld dictionaries/common_tlds.dict domain.name
 On the other hand, if only selected algorithms need to be used, `--fuzzers`
 argument is available, which takes a comma-separated list.
 
-Note: non-existent algorithm names will be silently ignored.
-
 ```
-$ dnstwist --fuzzers homoglyph,hyphenation domain.name
+$ dnstwist --fuzzers "homoglyph,hyphenation" domain.name
 ```
 
 Apart from the colorful terminal output, the tool allows exporting results to

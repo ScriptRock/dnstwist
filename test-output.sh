@@ -23,7 +23,7 @@ then
 fi
 
 # grab an example permutation which has all DNS record types
-examplePermutation=$(echo $output | jq '[.[]|select(.dns_a and .dns_mx and .dns_ns)][0]')
+examplePermutation=$(echo $output | jq '[.[]|select(.dns_a and .dns_mx and .dns_ns and .domain and .fuzzer and .geoip)][0]')
 if [[ $examplePermutation = "null" ]]
 then
   echo "test failed: couldn't find result with dns_a, dns_mx, dns_ns keys"
